@@ -6,4 +6,4 @@ services:
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
       DISCORD_GUILD_ID: ${DISCORD_GUILD_ID}
     volumes:
-      - ./radio_phrases.txt:/app/radio_phrases.txt
+      - ./radio_phrases.txt:/usr/src/app/radio_phrases.txt
