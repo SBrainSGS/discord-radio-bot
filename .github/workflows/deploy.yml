@@ -22,6 +22,9 @@ jobs:
             # подтянуть изменения
             git pull origin main
 
+            echo "DISCORD_BOT_TOKEN=${{ secrets.DISCORD_BOT_TOKEN }}" > .env
+            echo "DISCORD_GUILD_ID=${{ secrets.DISCORD_GUILD_ID }}" >> .env
+            
             # пересобрать и перезапустить контейнеры
             docker compose down
             docker compose up -d --build
