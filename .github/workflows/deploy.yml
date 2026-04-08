@@ -17,13 +17,13 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /home/app
+            cd ${{ secrets.SERVER_FOLDER }}
 
             # подтянуть изменения
             git pull origin main
 
-            echo "DISCORD_BOT_TOKEN=${{ secrets.DISCORD_BOT_TOKEN }}" > .env
-            echo "DISCORD_GUILD_ID=${{ secrets.DISCORD_GUILD_ID }}" >> .env
+            export DISCORD_BOT_TOKEN=${{ secrets.DISCORD_BOT_TOKEN }}
+            export DISCORD_GUILD_ID=${{ secrets.DISCORD_GUILD_ID }}
             
             # пересобрать и перезапустить контейнеры
             docker compose down
