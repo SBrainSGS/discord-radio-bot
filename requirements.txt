@@ -1,0 +1,6 @@
+discord.py[voice]>=2.5,<3.0
+gTTS>=2.5.4,<3.0
+imageio-ffmpeg>=0.6,<1.0
+vosk
+sounddevice
+pynput
