@@ -38,9 +38,6 @@ REQUIRED_PHRASE_SECTION_NAMES = (
     "GROUP_TEMPLATES",
     "RADIO_START_LINES",
     "JOIN_ANNOUNCEMENTS",
-)
-
-OPTIONAL_PHRASE_SECTION_NAMES = (
     "LEAVE_ANNOUNCEMENTS",
 )
 
@@ -278,11 +275,7 @@ def build_leave_announcement(
     channel: discord.VoiceChannel | discord.StageChannel,
     phrase_library: PhraseLibrary,
 ) -> str:
-    try:
-        templates = phrase_library.get_section("LEAVE_ANNOUNCEMENTS")
-    except RuntimeError:
-        templates = ("{a} покинул канал {channel}.",)
-    template = random.choice(templates)
+    template = random.choice(phrase_library.get_section("LEAVE_ANNOUNCEMENTS"))
     member_name = safe_display_name(member)
     channel_name = NAME_SANITIZER.sub(" ", channel.name).strip() or "секретный канал"
     return template.format(a=member_name, channel=channel_name)
