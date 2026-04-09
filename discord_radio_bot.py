@@ -32,7 +32,7 @@ MAX_RADIO_INTERVAL = 900
 MAX_SAY_LENGTH = 500
 MAX_QUEUE_SIZE = 25
 
-PHRASE_SECTION_NAMES = (
+REQUIRED_PHRASE_SECTION_NAMES = (
     "SOLO_TEMPLATES",
     "DUO_TEMPLATES",
     "GROUP_TEMPLATES",
@@ -40,12 +40,19 @@ PHRASE_SECTION_NAMES = (
     "JOIN_ANNOUNCEMENTS",
 )
 
+OPTIONAL_PHRASE_SECTION_NAMES = (
+    "LEAVE_ANNOUNCEMENTS",
+)
+
+PHRASE_SECTION_NAMES = REQUIRED_PHRASE_SECTION_NAMES + OPTIONAL_PHRASE_SECTION_NAMES
+
 CATEGORY_VARIABLES = {
     "SOLO_TEMPLATES": ("a", "channel"),
     "DUO_TEMPLATES": ("a", "b", "channel"),
     "GROUP_TEMPLATES": ("a", "b", "c", "group", "channel"),
     "RADIO_START_LINES": tuple(),
     "JOIN_ANNOUNCEMENTS": ("a", "channel"),
+    "LEAVE_ANNOUNCEMENTS": ("a", "channel"),
 }
 
 NAME_SANITIZER = re.compile(r"[^0-9A-Za-zА-Яа-яЁё _.-]+")
@@ -120,7 +127,7 @@ class PhraseLibrary:
 
             parsed[current_section].append(line)
 
-        missing_sections = [name for name, phrases in parsed.items() if not phrases]
+        missing_sections = [name for name in REQUIRED_PHRASE_SECTION_NAMES if not parsed[name]]
         if missing_sections:
             joined = ", ".join(missing_sections)
             raise ValueError(f"В файле фраз пустые секции: {joined}")
@@ -167,7 +174,12 @@ def insert_phrase(path: Path, category: str, phrase: str) -> None:
                 break
 
     if start_index is None:
-        raise ValueError(f"Категория {category!r} не найдена в {path.name}.")
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(section_header)
+        lines.append(phrase)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+        return
 
     insert_at = end_index
     while insert_at > start_index + 1 and not lines[insert_at - 1].strip():
@@ -256,6 +268,21 @@ def build_join_announcement(
     phrase_library: PhraseLibrary,
 ) -> str:
     template = random.choice(phrase_library.get_section("JOIN_ANNOUNCEMENTS"))
+    member_name = safe_display_name(member)
+    channel_name = NAME_SANITIZER.sub(" ", channel.name).strip() or "секретный канал"
+    return template.format(a=member_name, channel=channel_name)
+
+
+def build_leave_announcement(
+    member: discord.Member,
+    channel: discord.VoiceChannel | discord.StageChannel,
+    phrase_library: PhraseLibrary,
+) -> str:
+    try:
+        templates = phrase_library.get_section("LEAVE_ANNOUNCEMENTS")
+    except RuntimeError:
+        templates = ("{a} покинул канал {channel}.",)
+    template = random.choice(templates)
     member_name = safe_display_name(member)
     channel_name = NAME_SANITIZER.sub(" ", channel.name).strip() or "секретный канал"
     return template.format(a=member_name, channel=channel_name)
@@ -447,16 +474,31 @@ class RadioAnnouncerBot(discord.Client):
         if not client or not client.is_connected() or not client.channel:
             return
 
-        if after.channel is None or after.channel.id != client.channel.id:
+        joined_tracked_channel = after.channel is not None and after.channel.id == client.channel.id
+        left_tracked_channel = before.channel is not None and before.channel.id == client.channel.id
+
+        if not joined_tracked_channel and not left_tracked_channel:
             return
 
         try:
-            phrase = build_join_announcement(member, after.channel, self.phrase_library)
-            await state.enqueue(SpeechRequest(text=phrase, author_name="join", is_radio=False))
+            if joined_tracked_channel and after.channel is not None:
+                phrase = build_join_announcement(member, after.channel, self.phrase_library)
+                await state.enqueue(SpeechRequest(text=phrase, author_name="join", is_radio=False))
+            elif left_tracked_channel and before.channel is not None:
+                phrase = build_leave_announcement(member, before.channel, self.phrase_library)
+                await state.enqueue(SpeechRequest(text=phrase, author_name="leave", is_radio=False))
         except asyncio.QueueFull:
-            logging.warning("Очередь переполнена, пропускаю приветствие для %s в guild=%s", member.id, member.guild.id)
+            logging.warning(
+                "Очередь переполнена, пропускаю озвучку смены канала для %s в guild=%s",
+                member.id,
+                member.guild.id,
+            )
         except Exception:
-            logging.exception("Не удалось озвучить вход участника %s в guild=%s", member.id, member.guild.id)
+            logging.exception(
+                "Не удалось озвучить смену канала участника %s в guild=%s",
+                member.id,
+                member.guild.id,
+            )
 
     def get_state(self, guild: discord.Guild) -> GuildAudioState:
         state = self.guild_states.get(guild.id)
