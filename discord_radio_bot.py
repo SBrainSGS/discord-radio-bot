@@ -48,8 +48,8 @@ CATEGORY_VARIABLES = {
     "DUO_TEMPLATES": ("a", "b", "channel"),
     "GROUP_TEMPLATES": ("a", "b", "c", "group", "channel"),
     "RADIO_START_LINES": tuple(),
-    "JOIN_ANNOUNCEMENTS": ("a", "channel"),
-    "LEAVE_ANNOUNCEMENTS": ("a", "channel"),
+    "JOIN_ANNOUNCEMENTS": ("a", "b", "channel"),
+    "LEAVE_ANNOUNCEMENTS": ("a", "b", "channel"),
 }
 
 NAME_SANITIZER = re.compile(r"[^0-9A-Za-zА-Яа-яЁё _.-]+")
@@ -223,6 +223,33 @@ def join_names(names: list[str]) -> str:
     return ", ".join(names[:-1]) + f" и {names[-1]}"
 
 
+def pick_announcement_template(
+    section_name: str,
+    phrase_library: PhraseLibrary,
+    has_other_human: bool,
+) -> str:
+    templates = list(phrase_library.get_section(section_name))
+    if has_other_human:
+        return random.choice(templates)
+
+    templates_without_b = [template for template in templates if "{b}" not in template]
+    return random.choice(templates_without_b or templates)
+
+
+def pick_other_human_name(
+    channel: discord.VoiceChannel | discord.StageChannel,
+    member: discord.Member,
+) -> str | None:
+    other_humans = [
+        safe_display_name(other_member)
+        for other_member in channel.members
+        if not other_member.bot and other_member.id != member.id
+    ]
+    if not other_humans:
+        return None
+    return random.choice(other_humans)
+
+
 def build_radio_phrase(
     channel: discord.VoiceChannel | discord.StageChannel,
     humans: list[discord.Member],
@@ -264,10 +291,11 @@ def build_join_announcement(
     channel: discord.VoiceChannel | discord.StageChannel,
     phrase_library: PhraseLibrary,
 ) -> str:
-    template = random.choice(phrase_library.get_section("JOIN_ANNOUNCEMENTS"))
+    other_human_name = pick_other_human_name(channel, member)
+    template = pick_announcement_template("JOIN_ANNOUNCEMENTS", phrase_library, other_human_name is not None)
     member_name = safe_display_name(member)
     channel_name = NAME_SANITIZER.sub(" ", channel.name).strip() or "секретный канал"
-    return template.format(a=member_name, channel=channel_name)
+    return template.format(a=member_name, b=other_human_name or member_name, channel=channel_name)
 
 
 def build_leave_announcement(
@@ -275,10 +303,11 @@ def build_leave_announcement(
     channel: discord.VoiceChannel | discord.StageChannel,
     phrase_library: PhraseLibrary,
 ) -> str:
-    template = random.choice(phrase_library.get_section("LEAVE_ANNOUNCEMENTS"))
+    other_human_name = pick_other_human_name(channel, member)
+    template = pick_announcement_template("LEAVE_ANNOUNCEMENTS", phrase_library, other_human_name is not None)
     member_name = safe_display_name(member)
     channel_name = NAME_SANITIZER.sub(" ", channel.name).strip() or "секретный канал"
-    return template.format(a=member_name, channel=channel_name)
+    return template.format(a=member_name, b=other_human_name or member_name, channel=channel_name)
 
 
 class GuildAudioState:
