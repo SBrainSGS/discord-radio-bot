@@ -31,6 +31,7 @@ MIN_RADIO_INTERVAL = 5
 MAX_RADIO_INTERVAL = 900
 MAX_SAY_LENGTH = 500
 MAX_QUEUE_SIZE = 25
+EMPTY_CHANNEL_CHECK_INTERVAL_SECONDS = 30
 
 REQUIRED_PHRASE_SECTION_NAMES = (
     "SOLO_TEMPLATES",
@@ -223,6 +224,21 @@ def join_names(names: list[str]) -> str:
     return ", ".join(names[:-1]) + f" и {names[-1]}"
 
 
+def get_human_members(
+    channel: discord.VoiceChannel | discord.StageChannel,
+    *,
+    exclude_member_id: int | None = None,
+) -> list[discord.Member]:
+    humans: list[discord.Member] = []
+    for member in channel.members:
+        if member.bot:
+            continue
+        if exclude_member_id is not None and member.id == exclude_member_id:
+            continue
+        humans.append(member)
+    return humans
+
+
 def pick_announcement_template(
     section_name: str,
     phrase_library: PhraseLibrary,
@@ -240,11 +256,7 @@ def pick_other_human_name(
     channel: discord.VoiceChannel | discord.StageChannel,
     member: discord.Member,
 ) -> str | None:
-    other_humans = [
-        safe_display_name(other_member)
-        for other_member in channel.members
-        if not other_member.bot and other_member.id != member.id
-    ]
+    other_humans = [safe_display_name(other_member) for other_member in get_human_members(channel, exclude_member_id=member.id)]
     if not other_humans:
         return None
     return random.choice(other_humans)
@@ -435,7 +447,7 @@ class GuildAudioState:
                 if client.is_playing() or self.queue.qsize() > 2:
                     continue
 
-                humans = [member for member in client.channel.members if not member.bot]
+                humans = get_human_members(client.channel)
                 if not humans:
                     continue
 
@@ -458,11 +470,16 @@ class RadioAnnouncerBot(discord.Client):
         self.phrase_library = PhraseLibrary(PHRASE_LIBRARY_PATH)
         self.synthesizer = GTTSSpeechSynthesizer()
         self.guild_states: dict[int, GuildAudioState] = {}
+        self.empty_channel_monitor_task: asyncio.Task[None] | None = None
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.register_commands()
 
     async def setup_hook(self) -> None:
         self.main_loop = asyncio.get_running_loop()
+        self.empty_channel_monitor_task = asyncio.create_task(
+            self.empty_channel_monitor_loop(),
+            name="empty-channel-monitor",
+        )
         logging.info("TTS provider locked to gTTS (%s.%s)", GTTS_LANGUAGE, GTTS_TLD)
         logging.info("Phrase hot reload is enabled for %s", self.phrase_library.path.name)
 
@@ -478,6 +495,26 @@ class RadioAnnouncerBot(discord.Client):
 
     async def on_ready(self) -> None:
         logging.info("READY: %s (%s), guilds=%s", self.user, self.user.id if self.user else "?", len(self.guilds))
+
+    async def empty_channel_monitor_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(EMPTY_CHANNEL_CHECK_INTERVAL_SECONDS)
+                for state in list(self.guild_states.values()):
+                    client = state.voice_client
+                    if not client or not client.is_connected() or not client.channel:
+                        continue
+                    if get_human_members(client.channel):
+                        continue
+
+                    logging.info(
+                        "В канале %s не осталось людей, отключаюсь в guild=%s",
+                        client.channel.id,
+                        state.guild.id,
+                    )
+                    await state.leave()
+        except asyncio.CancelledError:
+            raise
 
     async def on_voice_state_update(
         self,
@@ -530,6 +567,13 @@ class RadioAnnouncerBot(discord.Client):
         return state
 
     async def close(self) -> None:
+        if self.empty_channel_monitor_task:
+            self.empty_channel_monitor_task.cancel()
+            try:
+                await self.empty_channel_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self.empty_channel_monitor_task = None
         for state in list(self.guild_states.values()):
             await state.shutdown()
         await super().close()
