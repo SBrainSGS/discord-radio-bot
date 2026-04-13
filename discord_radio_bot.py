@@ -32,6 +32,7 @@ MAX_RADIO_INTERVAL = 900
 MAX_SAY_LENGTH = 500
 MAX_QUEUE_SIZE = 25
 EMPTY_CHANNEL_CHECK_INTERVAL_SECONDS = 30
+ROLE_ANNOUNCEMENT_DELAY_SECONDS = 60
 
 REQUIRED_PHRASE_SECTION_NAMES = (
     "SOLO_TEMPLATES",
@@ -54,6 +55,21 @@ CATEGORY_VARIABLES = {
 }
 
 NAME_SANITIZER = re.compile(r"[^0-9A-Za-zА-Яа-яЁё _.-]+")
+
+ROLE_DELAYED_ANNOUNCEMENTS = {
+    1426625952544194690: {
+        "join": "ВНИМАНИЕ! Данил Коробкин сосёт пенисы!",
+        "leave": "И вот он похоже их дососал!",
+    },
+    778686479312486420: {
+        "join": "Я пришел сюда жевать жвачку и сосать хуй. Хуй я уже дососал...",
+        "leave": "Досвидос, гитлер",
+    },
+    1319787160613687367: {
+        "join": "Женский персонаж",
+        "leave": "Женский персонаж покинул чат",
+    },
+}
 
 
 @dataclass(slots=True)
@@ -260,6 +276,21 @@ def pick_other_human_name(
     if not other_humans:
         return None
     return random.choice(other_humans)
+
+
+def resolve_member_delayed_announcement(member: discord.Member, event_type: str) -> str | None:
+    matched_configs: list[tuple[int, dict[str, str]]] = []
+    for role in member.roles:
+        config = ROLE_DELAYED_ANNOUNCEMENTS.get(role.id)
+        if config:
+            matched_configs.append((role.position, config))
+
+    if not matched_configs:
+        return None
+
+    matched_configs.sort(key=lambda item: item[0], reverse=True)
+    text = matched_configs[0][1].get(event_type, "").strip()
+    return text or None
 
 
 def build_radio_phrase(
@@ -471,6 +502,7 @@ class RadioAnnouncerBot(discord.Client):
         self.synthesizer = GTTSSpeechSynthesizer()
         self.guild_states: dict[int, GuildAudioState] = {}
         self.empty_channel_monitor_task: asyncio.Task[None] | None = None
+        self.delayed_announcement_tasks: set[asyncio.Task[None]] = set()
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.register_commands()
 
@@ -495,6 +527,70 @@ class RadioAnnouncerBot(discord.Client):
 
     async def on_ready(self) -> None:
         logging.info("READY: %s (%s), guilds=%s", self.user, self.user.id if self.user else "?", len(self.guilds))
+
+    def schedule_delayed_role_announcement(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        member_id: int,
+        event_type: str,
+        text: str,
+    ) -> None:
+        task = asyncio.create_task(
+            self.delayed_role_announcement(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                member_id=member_id,
+                event_type=event_type,
+                text=text,
+            ),
+            name=f"role-announcement-{event_type}-{guild_id}-{member_id}",
+        )
+        self.delayed_announcement_tasks.add(task)
+        task.add_done_callback(self.delayed_announcement_tasks.discard)
+
+    async def delayed_role_announcement(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        member_id: int,
+        event_type: str,
+        text: str,
+    ) -> None:
+        await asyncio.sleep(ROLE_ANNOUNCEMENT_DELAY_SECONDS)
+
+        state = self.guild_states.get(guild_id)
+        if state is None:
+            return
+
+        client = state.voice_client
+        if not client or not client.is_connected() or not client.channel or client.channel.id != channel_id:
+            return
+
+        member = state.guild.get_member(member_id)
+        if event_type == "join":
+            if member is None or member.voice is None or member.voice.channel is None or member.voice.channel.id != channel_id:
+                return
+        elif event_type == "leave":
+            if member is not None and member.voice is not None and member.voice.channel is not None and member.voice.channel.id == channel_id:
+                return
+
+        try:
+            await state.enqueue(SpeechRequest(text=text, author_name=f"role-{event_type}", is_radio=False))
+        except asyncio.QueueFull:
+            logging.warning(
+                "Очередь переполнена, пропускаю delayed role announcement для %s в guild=%s",
+                member_id,
+                guild_id,
+            )
+        except Exception:
+            logging.exception(
+                "Не удалось озвучить delayed role announcement для %s в guild=%s",
+                member_id,
+                guild_id,
+            )
 
     async def empty_channel_monitor_loop(self) -> None:
         try:
@@ -541,9 +637,29 @@ class RadioAnnouncerBot(discord.Client):
 
         try:
             if joined_tracked_channel and after.channel is not None:
+                delayed_text = resolve_member_delayed_announcement(member, "join")
+                if delayed_text:
+                    self.schedule_delayed_role_announcement(
+                        guild_id=member.guild.id,
+                        channel_id=after.channel.id,
+                        member_id=member.id,
+                        event_type="join",
+                        text=delayed_text,
+                    )
+                    return
                 phrase = build_join_announcement(member, after.channel, self.phrase_library)
                 await state.enqueue(SpeechRequest(text=phrase, author_name="join", is_radio=False))
             elif left_tracked_channel and before.channel is not None:
+                delayed_text = resolve_member_delayed_announcement(member, "leave")
+                if delayed_text:
+                    self.schedule_delayed_role_announcement(
+                        guild_id=member.guild.id,
+                        channel_id=before.channel.id,
+                        member_id=member.id,
+                        event_type="leave",
+                        text=delayed_text,
+                    )
+                    return
                 phrase = build_leave_announcement(member, before.channel, self.phrase_library)
                 await state.enqueue(SpeechRequest(text=phrase, author_name="leave", is_radio=False))
         except asyncio.QueueFull:
@@ -567,6 +683,14 @@ class RadioAnnouncerBot(discord.Client):
         return state
 
     async def close(self) -> None:
+        for task in list(self.delayed_announcement_tasks):
+            task.cancel()
+        for task in list(self.delayed_announcement_tasks):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.delayed_announcement_tasks.clear()
         if self.empty_channel_monitor_task:
             self.empty_channel_monitor_task.cancel()
             try:
