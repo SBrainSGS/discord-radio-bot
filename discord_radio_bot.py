@@ -646,7 +646,6 @@ class RadioAnnouncerBot(discord.Client):
                         event_type="join",
                         text=delayed_text,
                     )
-                    return
                 phrase = build_join_announcement(member, after.channel, self.phrase_library)
                 await state.enqueue(SpeechRequest(text=phrase, author_name="join", is_radio=False))
             elif left_tracked_channel and before.channel is not None:
