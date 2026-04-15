@@ -32,7 +32,7 @@ MAX_RADIO_INTERVAL = 900
 MAX_SAY_LENGTH = 500
 MAX_QUEUE_SIZE = 25
 EMPTY_CHANNEL_CHECK_INTERVAL_SECONDS = 30
-ROLE_ANNOUNCEMENT_DELAY_SECONDS = 60
+ROLE_ANNOUNCEMENT_DELAY_SECONDS = 25
 
 REQUIRED_PHRASE_SECTION_NAMES = (
     "SOLO_TEMPLATES",
@@ -658,7 +658,6 @@ class RadioAnnouncerBot(discord.Client):
                         event_type="leave",
                         text=delayed_text,
                     )
-                    return
                 phrase = build_leave_announcement(member, before.channel, self.phrase_library)
                 await state.enqueue(SpeechRequest(text=phrase, author_name="leave", is_radio=False))
         except asyncio.QueueFull:
