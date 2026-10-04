@@ -604,6 +604,7 @@ class GuildAudioState:
                     raise maybe_error
             except asyncio.TimeoutError:
                 client.stop()
+                self.last_error = "Playback timeout"
                 logging.warning("Playback timed out in guild=%s", self.guild.id)
             except Exception as exc:
                 self.last_error = type(exc).__name__

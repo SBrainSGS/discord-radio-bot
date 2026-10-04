@@ -1,6 +1,7 @@
 """Persistent guild preferences and radio-host features."""
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import math
@@ -202,7 +203,7 @@ class HostFeatures:
         return None
 
     async def announce(self, state, member, channel, event, phrase):
-        key = (state.guild.id, channel.id, event)
+        key = (state.guild.id, channel.id, event, state.generation)
         context = ""
         now = time.monotonic()
         member_key = (state.guild.id, member.id)
@@ -224,8 +225,7 @@ class HostFeatures:
             self.departures = {k: v for k, v in self.departures.items() if now - v < 86400}
 
     def clear_guild(self, guild_id):
-        # Generation checks make in-flight batch tasks harmless after a move.
-        # Keep their keys until completion so an old task cannot erase a new batch.
+        # Batch keys include generation, so an old task cannot erase a new batch.
         for key in list(self.muted):
             if key[0] == guild_id:
                 self.muted.pop(key, None)
@@ -395,7 +395,12 @@ class HostFeatures:
             values = self.bot.phrase_library.get_section(category)
             start = (page - 1) * 5
             text = "\n".join(f"{n+1}. {p[:300]}" for n, p in enumerate(values) if start <= n < start + 5)
-            await i.response.send_message(text or "Страница пуста.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            selected = [(n, p) for n, p in enumerate(values) if start <= n < start + 5]
+            if any(len(p) > 300 for _, p in selected):
+                full = "\n".join(f"{n+1}. {p}" for n, p in selected)
+                await i.response.send_message(text, file=discord.File(io.BytesIO(full.encode("utf-8")), filename="phrases.txt"), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await i.response.send_message(text or "Страница пуста.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
         @tree.command(name="remove_phrase", description="Удалить фразу по номеру из /phrases")
         @app_commands.guild_only()
@@ -447,7 +452,7 @@ class HostFeatures:
         @app_commands.checks.has_permissions(manage_guild=True)
         async def backup(i: discord.Interaction):
             self.backup()
-            await i.response.send_message("Копия сохранена в data/backups (последние 7 пар копий).", ephemeral=True)
+            await i.response.send_message("Копия сохранена в data/backups (14 последних файлов).", ephemeral=True)
 
 
 def random_prefix(values):
