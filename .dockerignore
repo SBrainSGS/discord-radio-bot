@@ -6,3 +6,9 @@ __pycache__/
 .git/
 .gitignore
 dev.sh
+.env
+.venv/
+data/
+radio_phrases.txt
+*.bak
+.test-deps/

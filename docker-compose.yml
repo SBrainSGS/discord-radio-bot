@@ -2,8 +2,25 @@ services:
   bot:
     build: .
     container_name: discord-radio-bot
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib,time; p=pathlib.Path('/tmp/discord-radio-ready'); assert p.exists() and time.time()-p.stat().st_mtime < 660"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
     environment:
-      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
-      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?Set DISCORD_BOT_TOKEN in .env}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      PHRASE_LIBRARY_PATH: /usr/src/app/data/radio_phrases.txt
     volumes:
-      - ./radio_phrases.txt:/usr/src/app/radio_phrases.txt
+      - radio-data:/usr/src/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  radio-data:

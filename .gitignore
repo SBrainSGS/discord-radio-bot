@@ -2,3 +2,8 @@
 /__pycache__/
 /dev.sh
 radio_phrases.txt
+.env
+.venv/
+*.bak
+data/
+.test-deps/

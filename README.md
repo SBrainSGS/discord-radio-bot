@@ -1,0 +1,127 @@
+# Discord Radio Bot
+
+Русский TTS-бот для голосовых каналов Discord. Озвучивает вход и выход,
+случайные радиофразы и сообщения пользователей. Ролевые реплики идут
+дополнительно через 25 секунд. Пустой канал проверяется каждые 5 минут.
+
+## Настройка Discord
+
+1. Создай приложение в https://discord.com/developers/applications и добавь Bot.
+2. В разделе Bot включи **Server Members Intent**. Message Content Intent не нужен.
+3. Скопируй токен в серверный `.env`. Не публикуй его в Git или чатах.
+4. В OAuth2 URL Generator выбери `bot` и `applications.commands`.
+5. Дай боту права View Channels, Connect и Speak; приглашение Administrator не нужно.
+6. Для Stage Channel требуется возможность говорить, а не оставаться слушателем.
+
+## Новый Linux-сервер
+
+Нужны Git, Docker Engine и Docker Compose v2. Установка Docker:
+https://docs.docker.com/engine/install/ubuntu/
+
+```bash
+git clone https://github.com/SBrainSGS/discord-radio-bot.git
+cd discord-radio-bot
+cp .env.example .env
+chmod 600 .env
+nano .env
+```
+
+В `.env` укажи `DISCORD_BOT_TOKEN`. `DISCORD_GUILD_ID` необязателен:
+с ним команды регистрируются сразу на одном сервере; без него используются
+глобальные команды Discord. ID копируется в режиме разработчика Discord.
+
+```bash
+docker compose up -d --build --wait --wait-timeout 120
+docker compose logs -f --tail=100 bot
+```
+
+Исходящий HTTPS и UDP должны быть разрешены для TTS и Discord voice.
+Открывать входящий HTTP-порт боту не требуется.
+Проверка здоровья показывает регистрацию в Discord и свежий heartbeat;
+она не проверяет реальную слышимость аудио или доступность gTTS.
+Docker перезапускает упавший процесс, но сам статус unhealthy его не перезапускает.
+
+## Перенос старых фраз
+
+Новый Compose хранит фразы в volume `radio-data`. Старый серверный
+`radio_phrases.txt` автоматически не импортируется: перенеси его **до запуска**.
+Файл должен содержать все шесть базовых секций из `radio_phrases.example.txt`.
+Неизвестные переменные шаблонов будут отклонены при загрузке.
+
+```bash
+docker compose build
+docker compose run --rm --no-deps --user root --entrypoint sh \
+  -v "$PWD/radio_phrases.txt:/old-phrases.txt:ro" bot \
+  -c 'cp /old-phrases.txt /usr/src/app/data/radio_phrases.txt && chown 10001:10001 /usr/src/app/data/radio_phrases.txt'
+docker compose up -d --wait --wait-timeout 120
+```
+
+Если старого файла нет, бот создаст библиотеку из примера. Существующий файл
+он не перезаписывает. `/add_phrase` сохраняет предыдущее содержимое в `.bak`.
+
+## Команды
+
+| Команда | Назначение | Доступ |
+| --- | --- | --- |
+| `/join` | Войти в твой voice-канал | Все; перемещать уже подключённого бота может только управляющий сервером |
+| `/say` | Озвучить текст, до 500 символов | Все, пауза 5 секунд между командами |
+| `/leave` | Выйти, остановить радио, очистить очередь | Manage Server |
+| `/radio` | Включить/выключить радио, задать интервал | Manage Server |
+| `/phrase_help` | Категории и переменные | Все |
+| `/add_phrase` | Добавить проверенный шаблон | Manage Server |
+
+В join/leave `{a}` — участник события, `{b}` — другой человек в канале.
+При отсутствии других людей выбираются шаблоны без `{b}`, если они есть.
+Если все шаблоны содержат `{b}`, подставляется имя самого участника.
+
+Ролевые фразы находятся в `ROLE_DELAYED_ANNOUNCEMENTS` внутри Python-файла:
+Danil `1426625952544194690`, Admin `778686479312486420`, Women `1319787160613687367`.
+При нескольких ролях выбирается самая высокая в иерархии Discord.
+Обычный анонс идёт сразу; ролевая фраза добавляется в очередь через 25 секунд.
+Если очередь занята, звук начнётся позднее. Устаревшие таймеры отменяются.
+
+## Обновление и резервные копии
+
+```bash
+git fetch origin main
+git checkout --detach origin/main
+docker compose build --pull
+docker compose up -d --wait --wait-timeout 120
+```
+
+Сборка проходит до замены запущенного контейнера. Сохраняй бэкапы вне проекта:
+
+```bash
+docker compose cp bot:/usr/src/app/data/radio_phrases.txt ./radio_phrases.backup.txt
+```
+
+Не выполняй `docker compose down -v`, если хочешь сохранить фразы.
+Для отката выбери предыдущий Git SHA и повтори сборку/запуск;
+автоматический откат сейчас не реализован.
+
+## GitHub Actions
+
+CI проверяет тесты, синтаксис и сборку Docker. Deploy запускается вручную;
+после настройки сервера добавь repository variable `ENABLE_AUTO_DEPLOY=true`,
+чтобы включить запуск после успешного CI на main. Добавь repository secrets:
+`SERVER_IP`, `SERVER_USER`, `SSH_PRIVATE_KEY`, `SERVER_FOLDER`.
+На сервере заранее должны быть checkout, Docker и заполненный `.env`.
+SSH-пользователю нужен доступ к Docker. Workflow не переносит старые фразы.
+Токен берётся из серверного `.env`, а не из прежнего GitHub secret.
+Если старый деплой ещё настроен, перенеси `.env` и фразы до включения нового Deploy.
+
+## Разработка
+
+Python 3.13 используется в Docker и CI; код также тестируется локально на 3.12.
+
+```bash
+python -m venv .venv
+# Linux: source .venv/bin/activate
+# Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+Для локального запуска экспортируй переменные из `.env` в окружение
+или используй Docker: сам Python-скрипт `.env` не читает.
+Реальный voice-тест требует токен и Discord-сервер; тесты используют подменённые подключения.

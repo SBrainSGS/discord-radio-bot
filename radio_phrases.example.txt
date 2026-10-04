@@ -1,0 +1,20 @@
+# Templates for a fresh installation. Existing server data is never replaced.
+[SOLO_TEMPLATES]
+На связи {a}, канал {channel}.
+
+[DUO_TEMPLATES]
+В эфире {a} и {b}, канал {channel}.
+
+[GROUP_TEMPLATES]
+Сегодня на связи {group}.
+
+[RADIO_START_LINES]
+Радио включено. Всем хорошего вечера!
+
+[JOIN_ANNOUNCEMENTS]
+В канал {channel} зашёл {a}.
+{a} присоединился к {b} в канале {channel}.
+
+[LEAVE_ANNOUNCEMENTS]
+{a} покинул канал {channel}.
+{a} вышел, а {b} остался в канале {channel}.

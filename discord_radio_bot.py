@@ -4,6 +4,8 @@ import os
 import random
 import re
 import tempfile
+import shutil
+from string import Formatter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from discord import app_commands
 from gtts import gTTS
 
 BASE_DIR = Path(__file__).resolve().parent
-PHRASE_LIBRARY_PATH = BASE_DIR / "radio_phrases.txt"
+PHRASE_LIBRARY_PATH = Path(os.getenv("PHRASE_LIBRARY_PATH", str(BASE_DIR / "radio_phrases.txt")))
 
 DISCORD_BOT_TOKEN_ENV = "DISCORD_BOT_TOKEN"
 DISCORD_GUILD_ID_ENV = "DISCORD_GUILD_ID"
@@ -31,8 +33,9 @@ MIN_RADIO_INTERVAL = 5
 MAX_RADIO_INTERVAL = 900
 MAX_SAY_LENGTH = 500
 MAX_QUEUE_SIZE = 25
-EMPTY_CHANNEL_CHECK_INTERVAL_SECONDS = 30
+EMPTY_CHANNEL_CHECK_INTERVAL_SECONDS = 300
 ROLE_ANNOUNCEMENT_DELAY_SECONDS = 25
+PLAYBACK_TIMEOUT_SECONDS = 120
 
 REQUIRED_PHRASE_SECTION_NAMES = (
     "SOLO_TEMPLATES",
@@ -77,11 +80,16 @@ class SpeechRequest:
     text: str
     author_name: str
     is_radio: bool = False
+    channel_id: int | None = None
+    generation: int = 0
 
 
 class PhraseLibrary:
     def __init__(self, path: Path) -> None:
         self.path = path
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(BASE_DIR / "radio_phrases.example.txt", path)
         self._sections = {name: tuple() for name in PHRASE_SECTION_NAMES}
         self._mtime_ns: int | None = None
         self.reload_if_changed(force=True, required=True)
@@ -139,6 +147,7 @@ class PhraseLibrary:
             if current_section is None:
                 raise ValueError(f"Фраза вне секции в строке {line_number}")
 
+            validate_phrase(current_section, line)
             parsed[current_section].append(line)
 
         missing_sections = [name for name in REQUIRED_PHRASE_SECTION_NAMES if not parsed[name]]
@@ -155,13 +164,26 @@ class GTTSSpeechSynthesizer:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
 
     async def synthesize(self, text: str) -> Path:
+        task = asyncio.create_task(asyncio.to_thread(self._synthesize, text))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                path = await task
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+    def _synthesize(self, text: str) -> Path:
         handle, raw_path = tempfile.mkstemp(prefix="tts_gtts_", suffix=".mp3", dir=self.temp_dir)
         os.close(handle)
         output_path = Path(raw_path)
-        await asyncio.to_thread(
-            gTTS(text=text, lang=GTTS_LANGUAGE, tld=GTTS_TLD, slow=False).save,
-            str(output_path),
-        )
+        try:
+            gTTS(text=text, lang=GTTS_LANGUAGE, tld=GTTS_TLD, slow=False, timeout=(5, 20)).save(str(output_path))
+        except BaseException:
+            output_path.unlink(missing_ok=True)
+            raise
         return output_path
 
 
@@ -169,7 +191,17 @@ def normalize_user_text(text: str) -> str:
     return " ".join(text.split()).strip()
 
 
+def validate_phrase(category: str, phrase: str) -> None:
+    if not phrase.strip() or phrase.strip().startswith(("[", "#", ";")) or "\n" in phrase or "\r" in phrase:
+        raise ValueError("Phrase must be a non-empty template on one line")
+    allowed = CATEGORY_VARIABLES[category]
+    for _, field, spec, conversion in Formatter().parse(phrase):
+        if field is not None and (field not in allowed or spec or conversion):
+            raise ValueError(f"Invalid template field: {field!r}. Allowed: {allowed}")
+
+
 def insert_phrase(path: Path, category: str, phrase: str) -> None:
+    validate_phrase(category, phrase)
     lines = path.read_text(encoding="utf-8-sig").splitlines()
     section_header = f"[{category}]"
 
@@ -192,15 +224,23 @@ def insert_phrase(path: Path, category: str, phrase: str) -> None:
             lines.append("")
         lines.append(section_header)
         lines.append(phrase)
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
-        return
+    else:
+        insert_at = end_index
+        while insert_at > start_index + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, phrase)
 
-    insert_at = end_index
-    while insert_at > start_index + 1 and not lines[insert_at - 1].strip():
-        insert_at -= 1
-
-    lines.insert(insert_at, phrase)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    shutil.copyfile(path, path.with_suffix(path.suffix + ".bak"))
+    handle, raw_path = tempfile.mkstemp(dir=path.parent, prefix="phrases-", suffix=".tmp")
+    temporary = Path(raw_path)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8-sig") as stream:
+            stream.write("\n".join(lines) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def format_template_variables(category: str) -> str:
@@ -362,20 +402,37 @@ class GuildAudioState:
         self.radio_task: asyncio.Task[None] | None = None
         self.radio_interval_min = DEFAULT_RADIO_INTERVAL_MIN
         self.radio_interval_max = DEFAULT_RADIO_INTERVAL_MAX
+        self.connection_lock = asyncio.Lock()
+        self.generation = 0
 
     @property
     def voice_client(self) -> discord.VoiceClient | None:
         return self.guild.voice_client
 
     async def ensure_connected(self, channel: discord.VoiceChannel | discord.StageChannel) -> discord.VoiceClient:
+        async with self.connection_lock:
+            return await self._ensure_connected(channel)
+
+    async def _ensure_connected(self, channel: discord.VoiceChannel | discord.StageChannel) -> discord.VoiceClient:
         current = self.voice_client
         if current and current.is_connected():
             if current.channel and current.channel.id != channel.id:
+                self.generation += 1
+                await self.clear_queue()
+                self.bot.cancel_guild_announcements(self.guild.id)
+                if current.is_playing():
+                    current.stop()
                 await current.move_to(channel)
             return current
+        self.generation += 1
         return await channel.connect(self_deaf=True)
 
     async def enqueue(self, request: SpeechRequest) -> int:
+        client = self.voice_client
+        if not client or not client.is_connected() or not client.channel:
+            raise RuntimeError("Bot is not connected to voice")
+        request.channel_id = client.channel.id
+        request.generation = self.generation
         if self.queue.full():
             raise asyncio.QueueFull
         self.queue.put_nowait(request)
@@ -404,6 +461,8 @@ class GuildAudioState:
             await self.radio_task
         except asyncio.CancelledError:
             pass
+        except Exception:
+            logging.exception("Radio task failed in guild=%s", self.guild.id)
         self.radio_task = None
         return True
 
@@ -416,6 +475,12 @@ class GuildAudioState:
         return True
 
     async def leave(self) -> tuple[bool, int]:
+        async with self.connection_lock:
+            return await self._leave()
+
+    async def _leave(self) -> tuple[bool, int]:
+        self.generation += 1
+        self.bot.cancel_guild_announcements(self.guild.id)
         await self.stop_radio()
         cleared = await self.clear_queue()
         client = self.voice_client
@@ -438,12 +503,15 @@ class GuildAudioState:
         while True:
             request = await self.queue.get()
             audio_path: Path | None = None
+            source = None
             try:
                 client = self.voice_client
-                if not client or not client.is_connected():
+                if not self.request_is_current(request, client):
                     continue
 
                 audio_path = await self.bot.synthesizer.synthesize(request.text)
+                if not self.request_is_current(request, self.voice_client):
+                    continue
                 source = discord.FFmpegOpusAudio(
                     source=str(audio_path),
                     executable=self.bot.ffmpeg_path,
@@ -453,20 +521,30 @@ class GuildAudioState:
                 finished = self.bot.main_loop.create_future()
 
                 def after_playback(error: Exception | None) -> None:
-                    if finished.done():
-                        return
-                    self.bot.main_loop.call_soon_threadsafe(finished.set_result, error)
+                    def finish() -> None:
+                        if not finished.done():
+                            finished.set_result(error)
+                    self.bot.main_loop.call_soon_threadsafe(finish)
 
                 client.play(source, after=after_playback)
-                maybe_error = await finished
+                maybe_error = await asyncio.wait_for(finished, PLAYBACK_TIMEOUT_SECONDS)
                 if maybe_error:
                     raise maybe_error
+            except asyncio.TimeoutError:
+                client.stop()
+                logging.warning("Playback timed out in guild=%s", self.guild.id)
             except Exception:
                 logging.exception("Ошибка воспроизведения в guild=%s", self.guild.id)
             finally:
+                if source:
+                    source.cleanup()
                 if audio_path:
                     audio_path.unlink(missing_ok=True)
                 self.queue.task_done()
+
+    def request_is_current(self, request: SpeechRequest, client: discord.VoiceClient | None) -> bool:
+        return bool(client and client.is_connected() and client.channel
+                    and client.channel.id == request.channel_id and self.generation == request.generation)
 
     async def radio_loop(self) -> None:
         try:
@@ -482,8 +560,11 @@ class GuildAudioState:
                 if not humans:
                     continue
 
-                phrase = build_radio_phrase(client.channel, humans, self.bot.phrase_library)
-                await self.enqueue(SpeechRequest(text=phrase, author_name="radio", is_radio=True))
+                try:
+                    phrase = build_radio_phrase(client.channel, humans, self.bot.phrase_library)
+                    await self.enqueue(SpeechRequest(text=phrase, author_name="radio", is_radio=True))
+                except Exception:
+                    logging.exception("Radio iteration failed in guild=%s", self.guild.id)
         except asyncio.CancelledError:
             raise
 
@@ -503,6 +584,8 @@ class RadioAnnouncerBot(discord.Client):
         self.guild_states: dict[int, GuildAudioState] = {}
         self.empty_channel_monitor_task: asyncio.Task[None] | None = None
         self.delayed_announcement_tasks: set[asyncio.Task[None]] = set()
+        self.pending_announcements: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self.health_path = Path(tempfile.gettempdir()) / "discord-radio-ready"
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.register_commands()
 
@@ -526,6 +609,7 @@ class RadioAnnouncerBot(discord.Client):
             logging.info("Slash-команды синхронизированы глобально")
 
     async def on_ready(self) -> None:
+        self.health_path.touch()
         logging.info("READY: %s (%s), guilds=%s", self.user, self.user.id if self.user else "?", len(self.guilds))
 
     def schedule_delayed_role_announcement(
@@ -549,6 +633,23 @@ class RadioAnnouncerBot(discord.Client):
         )
         self.delayed_announcement_tasks.add(task)
         task.add_done_callback(self.delayed_announcement_tasks.discard)
+        key = (guild_id, member_id)
+        old = self.pending_announcements.get(key)
+        if old:
+            old.cancel()
+        self.pending_announcements[key] = task
+        def clear_pending(done: asyncio.Task[None]) -> None:
+            if self.pending_announcements.get(key) is done:
+                self.pending_announcements.pop(key, None)
+            if not done.cancelled() and done.exception():
+                logging.error("Delayed announcement failed", exc_info=done.exception())
+        task.add_done_callback(clear_pending)
+
+    def cancel_guild_announcements(self, guild_id: int) -> None:
+        for key, task in list(self.pending_announcements.items()):
+            if key[0] == guild_id:
+                task.cancel()
+                self.pending_announcements.pop(key, None)
 
     async def delayed_role_announcement(
         self,
@@ -596,6 +697,10 @@ class RadioAnnouncerBot(discord.Client):
         try:
             while True:
                 await asyncio.sleep(EMPTY_CHANNEL_CHECK_INTERVAL_SECONDS)
+                if self.is_ready():
+                    self.health_path.touch()
+                else:
+                    self.health_path.unlink(missing_ok=True)
                 for state in list(self.guild_states.values()):
                     client = state.voice_client
                     if not client or not client.is_connected() or not client.channel:
@@ -608,7 +713,10 @@ class RadioAnnouncerBot(discord.Client):
                         client.channel.id,
                         state.guild.id,
                     )
-                    await state.leave()
+                    try:
+                        await state.leave()
+                    except Exception:
+                        logging.exception("Auto-leave failed in guild=%s", state.guild.id)
         except asyncio.CancelledError:
             raise
 
@@ -618,12 +726,27 @@ class RadioAnnouncerBot(discord.Client):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        if member.bot or before.channel == after.channel or member.guild is None:
+        if before.channel == after.channel or member.guild is None:
+            return
+
+        if member.bot:
+            if self.user and member.id == self.user.id:
+                state = self.guild_states.get(member.guild.id)
+                if state:
+                    state.generation += 1
+                    self.cancel_guild_announcements(member.guild.id)
+                    await state.clear_queue()
+                    if state.voice_client and state.voice_client.is_playing():
+                        state.voice_client.stop()
             return
 
         state = self.guild_states.get(member.guild.id)
         if state is None:
             return
+
+        pending = self.pending_announcements.pop((member.guild.id, member.id), None)
+        if pending:
+            pending.cancel()
 
         client = state.voice_client
         if not client or not client.is_connected() or not client.channel:
@@ -681,6 +804,7 @@ class RadioAnnouncerBot(discord.Client):
         return state
 
     async def close(self) -> None:
+        self.health_path.unlink(missing_ok=True)
         for task in list(self.delayed_announcement_tasks):
             task.cancel()
         for task in list(self.delayed_announcement_tasks):
@@ -702,6 +826,7 @@ class RadioAnnouncerBot(discord.Client):
 
     def register_commands(self) -> None:
         @self.tree.command(name="join", description="Бот заходит в твой голосовой канал")
+        @app_commands.checks.cooldown(1, 10, key=lambda i: (i.guild_id, i.user.id))
         @app_commands.guild_only()
         async def join(interaction: discord.Interaction) -> None:
             resolved = await self.ensure_voice_state(interaction)
@@ -723,6 +848,7 @@ class RadioAnnouncerBot(discord.Client):
             await interaction.followup.send(f"Подключился к `{channel.name}`. Диктор на позиции.", ephemeral=True)
 
         @self.tree.command(name="leave", description="Бот выходит из голосового канала")
+        @app_commands.checks.has_permissions(manage_guild=True)
         @app_commands.guild_only()
         async def leave(interaction: discord.Interaction) -> None:
             if interaction.guild is None:
@@ -740,6 +866,7 @@ class RadioAnnouncerBot(discord.Client):
                 await interaction.response.send_message("Я и так сейчас не нахожусь в голосовом канале.", ephemeral=True)
 
         @self.tree.command(name="say", description="Озвучить текст в голосовом канале")
+        @app_commands.checks.cooldown(1, 5, key=lambda i: (i.guild_id, i.user.id))
         @app_commands.describe(text="Текст для озвучки")
         @app_commands.guild_only()
         async def say(interaction: discord.Interaction, text: app_commands.Range[str, 1, MAX_SAY_LENGTH]) -> None:
@@ -776,6 +903,7 @@ class RadioAnnouncerBot(discord.Client):
             )
 
         @self.tree.command(name="radio", description="Включить или выключить автокомментарии про участников канала")
+        @app_commands.checks.has_permissions(manage_guild=True)
         @app_commands.describe(
             enabled="true - включить радио, false - выключить",
             min_interval_seconds="Минимальная пауза между репликами",
@@ -862,6 +990,7 @@ class RadioAnnouncerBot(discord.Client):
             await interaction.response.send_message(build_phrase_help_text(), ephemeral=True)
 
         @self.tree.command(name="add_phrase", description="Добавить новую фразу в библиотеку бота")
+        @app_commands.checks.has_permissions(manage_guild=True)
         @app_commands.describe(
             category="Категория фразы",
             text="Новая фраза для выбранной категории",
@@ -895,6 +1024,22 @@ class RadioAnnouncerBot(discord.Client):
                 ephemeral=True,
             )
 
+        @self.tree.error
+        async def command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+            if isinstance(error, app_commands.MissingPermissions):
+                message = "Для этой команды нужны права управления сервером."
+            elif isinstance(error, app_commands.CheckFailure) and not isinstance(error, app_commands.CommandOnCooldown):
+                message = "Зайди в канал бота. Перемещать его может только управляющий сервером."
+            elif isinstance(error, app_commands.CommandOnCooldown):
+                message = f"Подожди {error.retry_after:.0f} секунд."
+            else:
+                logging.error("Command failed: %s", error, exc_info=error)
+                message = "Команда не выполнена. Подробности в логах бота."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+
     async def ensure_voice_state(
         self,
         interaction: discord.Interaction,
@@ -910,7 +1055,13 @@ class RadioAnnouncerBot(discord.Client):
         if not isinstance(member.voice.channel, (discord.VoiceChannel, discord.StageChannel)):
             return None
 
-        return self.get_state(interaction.guild), member.voice.channel
+        state = self.get_state(interaction.guild)
+        client = state.voice_client
+        if (client and client.is_connected() and client.channel
+                and client.channel.id != member.voice.channel.id
+                and not member.guild_permissions.manage_guild):
+            raise app_commands.CheckFailure("Only server managers may move the bot")
+        return state, member.voice.channel
 
 
 def main() -> None:
