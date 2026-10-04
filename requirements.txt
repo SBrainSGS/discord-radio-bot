@@ -1,3 +1,4 @@
 discord.py[voice]==2.7.1
 gTTS==2.5.4
 imageio-ffmpeg==0.6.0
+edge-tts==7.2.8

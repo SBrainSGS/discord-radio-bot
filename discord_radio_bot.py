@@ -5,6 +5,8 @@ import random
 import re
 import tempfile
 import shutil
+import time
+from collections import deque
 from string import Formatter
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,7 @@ import discord
 import imageio_ffmpeg
 from discord import app_commands
 from gtts import gTTS
+from radio_features import CachedSpeech, HostFeatures
 
 BASE_DIR = Path(__file__).resolve().parent
 PHRASE_LIBRARY_PATH = Path(os.getenv("PHRASE_LIBRARY_PATH", str(BASE_DIR / "radio_phrases.txt")))
@@ -92,7 +95,20 @@ class PhraseLibrary:
             shutil.copyfile(BASE_DIR / "radio_phrases.example.txt", path)
         self._sections = {name: tuple() for name in PHRASE_SECTION_NAMES}
         self._mtime_ns: int | None = None
+        self.recent = {}
         self.reload_if_changed(force=True, required=True)
+
+    def pick(self, section_name: str, has_other_human: bool = True) -> str:
+        templates = self.get_section(section_name)
+        if not has_other_human:
+            templates = tuple(t for t in templates if "{b}" not in t) or templates
+        recent = self.recent.setdefault(section_name, deque(maxlen=5))
+        available = [t for t in templates if t not in recent]
+        if not available:
+            available = [t for t in templates if not recent or t != recent[-1]] or list(templates)
+        chosen = random.choice(available)
+        recent.append(chosen)
+        return chosen
 
     def reload_if_changed(self, force: bool = False, required: bool = False) -> None:
         try:
@@ -250,6 +266,38 @@ def format_template_variables(category: str) -> str:
     return ", ".join(f"{{{variable}}}" for variable in variables)
 
 
+def remove_phrase(path: Path, category: str, number: int, expected: str) -> None:
+    parsed = PhraseLibrary._parse_file(path)
+    values = parsed[category]
+    if number < 1 or number > len(values):
+        raise ValueError("Нет фразы с таким номером.")
+    if values[number - 1] != expected:
+        raise ValueError("Фраза изменилась: скопируй полный текст из /phrases в expected.")
+    if len(values) <= 1:
+        raise ValueError("Нельзя удалить последнюю фразу обязательной категории.")
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    current, count = None, 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped[1:-1]
+        elif current == category and stripped and not stripped.startswith(("#", ";")):
+            count += 1
+            if count == number:
+                del lines[index]
+                break
+    shutil.copyfile(path, path.with_suffix(path.suffix + ".bak"))
+    fd, raw = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as stream:
+            stream.write("\n".join(lines) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(raw, path)
+    finally:
+        Path(raw).unlink(missing_ok=True)
+
+
 PHRASE_CATEGORY_CHOICES = [
     app_commands.Choice(
         name=f"{category} (Доступные переменные {format_template_variables(category)})",
@@ -300,6 +348,8 @@ def pick_announcement_template(
     phrase_library: PhraseLibrary,
     has_other_human: bool,
 ) -> str:
+    if isinstance(phrase_library, PhraseLibrary):
+        return phrase_library.pick(section_name, has_other_human)
     templates = list(phrase_library.get_section(section_name))
     if has_other_human:
         return random.choice(templates)
@@ -350,16 +400,16 @@ def build_radio_phrase(
     template_type = random.choice(available_template_types)
 
     if template_type == "solo":
-        template = random.choice(phrase_library.get_section("SOLO_TEMPLATES"))
+        template = phrase_library.pick("SOLO_TEMPLATES")
         return template.format(a=random.choice(names), channel=channel_name)
 
     if template_type == "duo":
         first, second = random.sample(names, 2)
-        template = random.choice(phrase_library.get_section("DUO_TEMPLATES"))
+        template = phrase_library.pick("DUO_TEMPLATES")
         return template.format(a=first, b=second, channel=channel_name)
 
     chosen = random.sample(names, k=min(3, len(names)))
-    template = random.choice(phrase_library.get_section("GROUP_TEMPLATES"))
+    template = phrase_library.pick("GROUP_TEMPLATES")
     return template.format(
         group=join_names(chosen),
         a=chosen[0],
@@ -404,6 +454,12 @@ class GuildAudioState:
         self.radio_interval_max = DEFAULT_RADIO_INTERVAL_MAX
         self.connection_lock = asyncio.Lock()
         self.generation = 0
+        self.last_error = None
+        self.last_finished = 0
+        self.recent_requests = deque(maxlen=8)
+        if hasattr(bot, "features"):
+            cfg = bot.features.settings(guild.id)
+            self.radio_interval_min, self.radio_interval_max = cfg["interval_min"], cfg["interval_max"]
 
     @property
     def voice_client(self) -> discord.VoiceClient | None:
@@ -414,6 +470,8 @@ class GuildAudioState:
             return await self._ensure_connected(channel)
 
     async def _ensure_connected(self, channel: discord.VoiceChannel | discord.StageChannel) -> discord.VoiceClient:
+        if hasattr(self.bot, "features") and not self.bot.features.allowed(self.guild.id, channel.id):
+            raise app_commands.CheckFailure("Этот канал не разрешён в /channel_access")
         current = self.voice_client
         if current and current.is_connected():
             if current.channel and current.channel.id != channel.id:
@@ -435,6 +493,11 @@ class GuildAudioState:
         request.generation = self.generation
         if self.queue.full():
             raise asyncio.QueueFull
+        if request.author_name not in ("test", "say"):
+            now = time.monotonic()
+            if any(text == request.text and now - stamp < 120 for text, stamp in self.recent_requests):
+                return self.queue.qsize()
+            self.recent_requests.append((request.text, now))
         self.queue.put_nowait(request)
         position = self.queue.qsize()
         if self.voice_client and self.voice_client.is_playing():
@@ -509,13 +572,22 @@ class GuildAudioState:
                 if not self.request_is_current(request, client):
                     continue
 
-                audio_path = await self.bot.synthesizer.synthesize(request.text)
+                cfg = self.bot.features.settings(self.guild.id) if hasattr(self.bot, "features") else None
+                if cfg:
+                    await asyncio.sleep(max(0, cfg["pause"] - (time.monotonic() - self.last_finished)))
+                    if not self.request_is_current(request, self.voice_client):
+                        continue
+                    text = self.bot.features.style(request.text, cfg) if request.author_name not in ("say", "test") else request.text
+                    audio_path = await self.bot.synthesizer.synthesize(text, voice=cfg["voice"], jingle=cfg["jingles"] and request.is_radio)
+                else:
+                    audio_path = await self.bot.synthesizer.synthesize(request.text)
                 if not self.request_is_current(request, self.voice_client):
                     continue
                 source = discord.FFmpegOpusAudio(
                     source=str(audio_path),
                     executable=self.bot.ffmpeg_path,
                     bitrate=96,
+                    options=f"-af volume={cfg['volume'] / 100}" if cfg else None,
                 )
 
                 finished = self.bot.main_loop.create_future()
@@ -533,13 +605,15 @@ class GuildAudioState:
             except asyncio.TimeoutError:
                 client.stop()
                 logging.warning("Playback timed out in guild=%s", self.guild.id)
-            except Exception:
+            except Exception as exc:
+                self.last_error = type(exc).__name__
                 logging.exception("Ошибка воспроизведения в guild=%s", self.guild.id)
             finally:
                 if source:
                     source.cleanup()
                 if audio_path:
                     audio_path.unlink(missing_ok=True)
+                self.last_finished = time.monotonic()
                 self.queue.task_done()
 
     def request_is_current(self, request: SpeechRequest, client: discord.VoiceClient | None) -> bool:
@@ -561,7 +635,7 @@ class GuildAudioState:
                     continue
 
                 try:
-                    phrase = build_radio_phrase(client.channel, humans, self.bot.phrase_library)
+                    phrase = self.bot.features.radio_phrase(self, client.channel, humans) if hasattr(self.bot, "features") else build_radio_phrase(client.channel, humans, self.bot.phrase_library)
                     await self.enqueue(SpeechRequest(text=phrase, author_name="radio", is_radio=True))
                 except Exception:
                     logging.exception("Radio iteration failed in guild=%s", self.guild.id)
@@ -581,6 +655,7 @@ class RadioAnnouncerBot(discord.Client):
         self.ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
         self.phrase_library = PhraseLibrary(PHRASE_LIBRARY_PATH)
         self.synthesizer = GTTSSpeechSynthesizer()
+        self.synthesizer = CachedSpeech(self.synthesizer, PHRASE_LIBRARY_PATH.parent / "tts-cache", self.ffmpeg_path)
         self.guild_states: dict[int, GuildAudioState] = {}
         self.empty_channel_monitor_task: asyncio.Task[None] | None = None
         self.delayed_announcement_tasks: set[asyncio.Task[None]] = set()
@@ -588,6 +663,8 @@ class RadioAnnouncerBot(discord.Client):
         self.health_path = Path(tempfile.gettempdir()) / "discord-radio-ready"
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.register_commands()
+        import sys
+        self.features = HostFeatures(self, sys.modules[__name__])
 
     async def setup_hook(self) -> None:
         self.main_loop = asyncio.get_running_loop()
@@ -595,7 +672,8 @@ class RadioAnnouncerBot(discord.Client):
             self.empty_channel_monitor_loop(),
             name="empty-channel-monitor",
         )
-        logging.info("TTS provider locked to gTTS (%s.%s)", GTTS_LANGUAGE, GTTS_TLD)
+        self.features.spawn(self.features.monitor())
+        logging.info("TTS: Edge Dmitry by default, gTTS fallback")
         logging.info("Phrase hot reload is enabled for %s", self.phrase_library.path.name)
 
         guild_id = DISCORD_GUILD_ID
@@ -646,6 +724,8 @@ class RadioAnnouncerBot(discord.Client):
         task.add_done_callback(clear_pending)
 
     def cancel_guild_announcements(self, guild_id: int) -> None:
+        if hasattr(self, "features"):
+            self.features.clear_guild(guild_id)
         for key, task in list(self.pending_announcements.items()):
             if key[0] == guild_id:
                 task.cancel()
@@ -660,7 +740,8 @@ class RadioAnnouncerBot(discord.Client):
         event_type: str,
         text: str,
     ) -> None:
-        await asyncio.sleep(ROLE_ANNOUNCEMENT_DELAY_SECONDS)
+        delay = self.features.settings(guild_id)["role_delay"] if hasattr(self, "features") else ROLE_ANNOUNCEMENT_DELAY_SECONDS
+        await asyncio.sleep(delay)
 
         state = self.guild_states.get(guild_id)
         if state is None:
@@ -726,6 +807,8 @@ class RadioAnnouncerBot(discord.Client):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
+        if hasattr(self, "features") and member.guild is not None:
+            self.features.observe_voice(member, after)
         if before.channel == after.channel or member.guild is None:
             return
 
@@ -760,7 +843,7 @@ class RadioAnnouncerBot(discord.Client):
 
         try:
             if joined_tracked_channel and after.channel is not None:
-                delayed_text = resolve_member_delayed_announcement(member, "join")
+                delayed_text = self.features.role_phrase(member, "join") if hasattr(self, "features") else resolve_member_delayed_announcement(member, "join")
                 if delayed_text:
                     self.schedule_delayed_role_announcement(
                         guild_id=member.guild.id,
@@ -770,9 +853,12 @@ class RadioAnnouncerBot(discord.Client):
                         text=delayed_text,
                     )
                 phrase = build_join_announcement(member, after.channel, self.phrase_library)
-                await state.enqueue(SpeechRequest(text=phrase, author_name="join", is_radio=False))
+                if hasattr(self, "features"):
+                    await self.features.announce(state, member, after.channel, "join", phrase)
+                else:
+                    await state.enqueue(SpeechRequest(text=phrase, author_name="join", is_radio=False))
             elif left_tracked_channel and before.channel is not None:
-                delayed_text = resolve_member_delayed_announcement(member, "leave")
+                delayed_text = self.features.role_phrase(member, "leave") if hasattr(self, "features") else resolve_member_delayed_announcement(member, "leave")
                 if delayed_text:
                     self.schedule_delayed_role_announcement(
                         guild_id=member.guild.id,
@@ -782,7 +868,10 @@ class RadioAnnouncerBot(discord.Client):
                         text=delayed_text,
                     )
                 phrase = build_leave_announcement(member, before.channel, self.phrase_library)
-                await state.enqueue(SpeechRequest(text=phrase, author_name="leave", is_radio=False))
+                if hasattr(self, "features"):
+                    await self.features.announce(state, member, before.channel, "leave", phrase)
+                else:
+                    await state.enqueue(SpeechRequest(text=phrase, author_name="leave", is_radio=False))
         except asyncio.QueueFull:
             logging.warning(
                 "Очередь переполнена, пропускаю озвучку смены канала для %s в guild=%s",
@@ -804,6 +893,8 @@ class RadioAnnouncerBot(discord.Client):
         return state
 
     async def close(self) -> None:
+        if hasattr(self, "features"):
+            await self.features.close()
         self.health_path.unlink(missing_ok=True)
         for task in list(self.delayed_announcement_tasks):
             task.cancel()
@@ -913,8 +1004,8 @@ class RadioAnnouncerBot(discord.Client):
         async def radio(
             interaction: discord.Interaction,
             enabled: bool = True,
-            min_interval_seconds: app_commands.Range[int, MIN_RADIO_INTERVAL, MAX_RADIO_INTERVAL] = DEFAULT_RADIO_INTERVAL_MIN,
-            max_interval_seconds: app_commands.Range[int, MIN_RADIO_INTERVAL, MAX_RADIO_INTERVAL] = DEFAULT_RADIO_INTERVAL_MAX,
+            min_interval_seconds: app_commands.Range[int, MIN_RADIO_INTERVAL, MAX_RADIO_INTERVAL] | None = None,
+            max_interval_seconds: app_commands.Range[int, MIN_RADIO_INTERVAL, MAX_RADIO_INTERVAL] | None = None,
         ) -> None:
             if interaction.guild is None:
                 await interaction.response.send_message("Эта команда работает только на сервере.", ephemeral=True)
@@ -933,6 +1024,9 @@ class RadioAnnouncerBot(discord.Client):
                     await interaction.response.send_message("Авторадио и так молчит.", ephemeral=True)
                 return
 
+            cfg = self.features.settings(interaction.guild.id)
+            min_interval_seconds = min_interval_seconds if min_interval_seconds is not None else cfg["interval_min"]
+            max_interval_seconds = max_interval_seconds if max_interval_seconds is not None else cfg["interval_max"]
             if min_interval_seconds > max_interval_seconds:
                 await interaction.response.send_message(
                     "Минимальный интервал не может быть больше максимального.",
@@ -953,10 +1047,11 @@ class RadioAnnouncerBot(discord.Client):
             try:
                 await state.ensure_connected(channel)
                 started = await state.start_radio(min_interval_seconds, max_interval_seconds)
+                self.features.preferences.update(interaction.guild.id, interval_min=min_interval_seconds, interval_max=max_interval_seconds)
                 if started:
                     await state.enqueue(
                         SpeechRequest(
-                            text=random.choice(self.phrase_library.get_section("RADIO_START_LINES")),
+                            text=self.phrase_library.pick("RADIO_START_LINES"),
                             author_name="radio",
                             is_radio=True,
                         )

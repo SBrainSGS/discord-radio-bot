@@ -8,3 +8,6 @@ radio_phrases.txt
 *.bak
 data/
 .test-deps/
+tts-cache/
+backups/
+settings.json

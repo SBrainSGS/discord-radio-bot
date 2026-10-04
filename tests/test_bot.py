@@ -179,7 +179,10 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(bot, 'PHRASE_LIBRARY_PATH', Path(folder) / 'phrases.txt'), patch.object(bot, 'GTTSSpeechSynthesizer'):
                 client = bot.RadioAnnouncerBot()
-                self.assertEqual({'join', 'leave', 'say', 'radio', 'phrase_help', 'add_phrase'}, {c.name for c in client.tree.get_commands()})
+                self.assertEqual({'join', 'leave', 'say', 'radio', 'phrase_help', 'add_phrase',
+                                  'settings', 'channel_access', 'role_phrase', 'phrases',
+                                  'remove_phrase', 'test_phrase', 'status', 'backup'},
+                                 {c.name for c in client.tree.get_commands()})
                 await client.close()
 
 

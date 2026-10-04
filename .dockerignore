@@ -12,3 +12,6 @@ data/
 radio_phrases.txt
 *.bak
 .test-deps/
+tts-cache/
+backups/
+settings.json
